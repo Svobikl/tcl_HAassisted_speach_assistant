@@ -1,0 +1,18 @@
+[Unit]
+Description=Persistent Warm Local Faster-Whisper STT Fallback Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=WHISPER_HOST=localhost
+Environment=WHISPER_PORT=8765
+Environment=WHISPER_MODEL=base
+Environment=WHISPER_LANGUAGE=cs
+Environment=WHISPER_THREADS=4
+ExecStart=/usr/bin/python3 /usr/local/bin/local_whisper_stt_server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

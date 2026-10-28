@@ -1,0 +1,17 @@
+[Unit]
+Description=TCL Android TV Home Assistant & Gemini Voice Assistant Provisioner & Remote Hook
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=TCL_TV_ADB_TARGET=<TV_IP_ADDRESS>:5555
+Environment=HA_APK_PATH=/usr/share/hassio/homeassistant/www/ha-companion-tv.apk
+ExecStart=/usr/bin/python3 /usr/share/hassio/homeassistant/tcl_tv_setup_gemini_assistant.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
