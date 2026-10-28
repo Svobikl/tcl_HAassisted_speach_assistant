@@ -27,6 +27,16 @@ from tcl_tv_setup_gemini_assistant import (
     should_trigger_assist_from_getevent_line,
     should_trigger_assist_from_log_line,
     simulate_vad_preroll_and_onset,
+    LONG_PRESS_HOLD_SEC,
+    activate_dictation_mode,
+    clear_dictation_mode,
+    consume_dictation_mode,
+    consume_dictation_request,
+    enqueue_dictation_request,
+    format_adb_input_text,
+    is_getevent_search_key_up,
+    parse_dictation_command,
+    should_activate_dictation_from_log_line,
 )
 
 
@@ -411,6 +421,105 @@ def test_pipeline_and_stt_files_contain_all_four_voice_fixes() -> None:
     assert "_CLIPPED_ZHASNI_RE" in stt_text
     assert "_expand_bare_area_command" in conv_text
     assert "speech_pad_ms" in whisper_text
+
+
+def test_parse_dictation_command_happy_and_negative() -> None:
+    """Verify Czech voice dictation prefix parsing ('Vyplň do pole: Matrix') and negative smart-home guards."""
+    assert parse_dictation_command("Vyplň do pole: Matrix") == ("Matrix", False)
+    assert parse_dictation_command("vyplň do pole Matrix Reloaded.") == ("Matrix Reloaded", False)
+    assert parse_dictation_command("Vyplň pole Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Vyplň text Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Vyplň Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Napiš do pole: Pelíšky") == ("Pelíšky", False)
+    assert parse_dictation_command("Napiš text Pelíšky") == ("Pelíšky", False)
+    assert parse_dictation_command("Napiš Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Zadej do pole Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Zadej Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Vepiš do pole Matrix") == ("Matrix", False)
+    assert parse_dictation_command("Vepiš Matrix") == ("Matrix", False)
+
+    # Search-submit variants (submit=True)
+    assert parse_dictation_command("Vyplň a vyhledej Matrix") == ("Matrix", True)
+    assert parse_dictation_command("Napiš a vyhledej Pelíšky") == ("Pelíšky", True)
+    assert parse_dictation_command("Zadej a vyhledej Matrix") == ("Matrix", True)
+    assert parse_dictation_command("Vyhledej v poli Matrix") == ("Matrix", True)
+
+    # Negative cases: smart-home commands, empty payloads, or 'vypni' must never match
+    assert parse_dictation_command("") is None
+    assert parse_dictation_command("   ") is None
+    assert parse_dictation_command("Vyplň do pole:") is None
+    assert parse_dictation_command("Napiš do pole") is None
+    assert parse_dictation_command("zhasni v obýváku") is None
+    assert parse_dictation_command("rozsviť světla v kuchyni") is None
+    assert parse_dictation_command("vypni televizi") is None
+    assert parse_dictation_command("vypni světlo v obýváku") is None
+    assert parse_dictation_command("jaká je denní spotřeba domu") is None
+    assert parse_dictation_command("v obýváku") is None
+
+
+def test_format_adb_input_text_ascii_and_metachar_sanitization() -> None:
+    """Verify Czech diacritics are transliterated to ASCII, spaces become %s, and shell metacharacters are stripped."""
+    assert format_adb_input_text("Matrix") == "Matrix"
+    assert format_adb_input_text("Matrix Reloaded") == "Matrix%sReloaded"
+    assert format_adb_input_text("Pelíšky 1999") == "Pelisky%s1999"
+    assert format_adb_input_text("Česká televize ČT1") == "Ceska%stelevize%sCT1"
+    assert format_adb_input_text("  Matrix; rm -rf /  ") == "Matrix%srm%s-rf%s/"
+    assert format_adb_input_text("") == ""
+    assert format_adb_input_text("   ") == ""
+
+
+def test_long_press_detection_and_dictation_queue_lifecycle(tmp_path) -> None:
+    """Verify long-press logcat/getevent detection and file-backed dictation mode + request queue lifecycle."""
+    assert 0.50 <= LONG_PRESS_HOLD_SEC <= 1.00
+    assert should_activate_dictation_from_log_line(
+        "I/ActivityManager( 2639): START u0 {act=android.intent.action.SEARCH_LONG_PRESS} from uid 1000"
+    )
+    assert (
+        should_activate_dictation_from_log_line(
+            "I/ActivityManager( 2639): START u0 {act=android.speech.action.WEB_SEARCH} from uid 1000"
+        )
+        is False
+    )
+    assert should_activate_dictation_from_log_line("") is False
+
+    assert is_getevent_search_key_up("/dev/input/event6: EV_KEY       KEY_SEARCH           UP                  ")
+    assert is_getevent_search_key_up("/dev/input/event6: EV_KEY       0246                 UP                  ")
+    assert (
+        is_getevent_search_key_up("/dev/input/event6: EV_KEY       KEY_SEARCH           DOWN                ")
+        is False
+    )
+    assert (
+        is_getevent_search_key_up("/dev/input/event6: EV_KEY       KEY_VOLUMEUP         UP                  ")
+        is False
+    )
+
+    mode_file = tmp_path / ".tcl_tv_dictation_mode.json"
+    req_file = tmp_path / ".tcl_tv_type_request.json"
+
+    assert consume_dictation_mode(mode_file) is False
+    activate_dictation_mode("test_long_press", mode_file=mode_file, ttl_sec=15.0)
+    assert mode_file.exists()
+    assert consume_dictation_mode(mode_file) is True
+    # Consuming a second time must return False (one-shot per voice turn)
+    assert consume_dictation_mode(mode_file) is False
+
+    # Expired dictation mode flag must return False
+    activate_dictation_mode("expired_test", mode_file=mode_file, ttl_sec=-1.0)
+    assert consume_dictation_mode(mode_file) is False
+
+    # Clear dictation mode explicitly
+    activate_dictation_mode("short_press_cancel", mode_file=mode_file, ttl_sec=15.0)
+    clear_dictation_mode(mode_file=mode_file)
+    assert consume_dictation_mode(mode_file) is False
+
+    # Dictation typing request queue
+    assert consume_dictation_request(req_file) is None
+    enqueue_dictation_request("Matrix Reloaded", submit=True, req_file=req_file)
+    req = consume_dictation_request(req_file)
+    assert req is not None
+    assert req["text"] == "Matrix Reloaded"
+    assert req["submit"] is True
+    assert consume_dictation_request(req_file) is None
 
 
 def test_repository_contains_zero_secrets() -> None:

@@ -42,6 +42,11 @@ Running the official Home Assistant Companion app (`io.homeassistant.companion.a
    - Primary STT uses `models/gemini-3.5-flash-lite` (`~1.05s – 1.30s` response time).
    - If the cloud API times out or hits rate limits (`429`), `homeassistant/custom_components/google_generative_ai_conversation/stt.py` calls `http://localhost:8765/transcribe?lang=cs&mode=local` (`scripts/local_whisper_stt_server.py`), which bypasses any redundant cloud retry and runs `faster-whisper` (`base` `int8`) with non-clipping `vad_parameters` (`threshold=0.20`, `speech_pad_ms=800`).
 
+7. **Voice-to-Text Field Dictation & Search Input Filling (Voice Prefix + Long-Press Remote Mic Button):**
+   - Replaces the native Google Assistant search-field typing capability on Android TV via **two convenient modes**:
+     1. **Voice Command Prefix (short press):** Say *"Vyplň do pole: Matrix"*, *"Napiš do pole Matrix"*, *"Zadej Matrix"*, *"Vepiš Matrix"*, or *"Vyplň a vyhledej Matrix"* (which also sends `KEYCODE_ENTER` after typing).
+     2. **Long-Press Remote Mic Button (`>= 0.65s` hold on `KEY_SEARCH` / `SEARCH_LONG_PRESS`):** Hold the microphone button down for at least `0.65s` and speak only the text you want to type (e.g., *"Matrix"*). `tcl-tv-assistant.service` automatically sets `.tcl_tv_dictation_mode.json`, dismisses `AssistActivity` as soon as transcription finishes, moves focus from Leanback `SpeechOrbView` to `SearchEditText` if needed, and injects the text directly into the TV input field via ADB.
+
 ---
 
 ## Architecture Flow
@@ -156,6 +161,9 @@ Tento repozitář obsahuje kompletní sadu skriptů a úprav pro plnohodnotného
    - Úprava bufferu `VoiceAudioRecorder` v `classes7.dex` ze `160` shorts (`10ms`) na `1600` shorts (`100ms`) odstraňuje zpoždění SQLite+WebSocket fronty na Android TV.
 5. **Rychlé Gemini STT (`~1.1 s`) + přímý `?mode=local` Faster-Whisper fallback:**
    - Primární přepis řeči zajišťuje `models/gemini-3.5-flash-lite` (`~1.1 s`), při výpadku internetu nebo vyčerpání kvóty (`429`) okamžitě přebírá přepis lokální démon `local-whisper-stt.service` (`localhost:8765/transcribe?lang=cs&mode=local`) bez duplicitního čekání na cloud.
+6. **Hlasové vyplňování vyhledávacích polí a formulářů v TV (povel i dlouhé podržení tlačítka mikrofonu):**
+   - **Režim 1 (hlasový povel při běžném stisku):** Stačí říct *„Vyplň do pole: Matrix“*, *„Napiš do pole Matrix“*, *„Zadej Matrix“*, *„Vepiš Matrix“* nebo *„Vyplň a vyhledej Matrix“* (které po vepsání rovnou odešle `Enter`).
+   - **Režim 2 (dlouhé podržení tlačítka mikrofonu `>= 0.65 s`):** Podrž tlačítko mikrofonu na ovladači alespoň `0,65 s` a řekni rovnou hledaný výraz (např. jen *„Matrix“*). Asistent automaticky aktivuje režim diktování do pole, po přepisu okamžitě zavře okno `AssistActivity`, vrátí fokus do vyhledávacího pole aplikace na TV a vypíše nadiktovaný text.
 
 ### Postup instalace v kostce
 1. Nastav adresu své TV v `/etc/systemd/system/tcl-tv-assistant.service` (`TCL_TV_ADB_TARGET=<TV_IP_ADDRESS>:5555`).

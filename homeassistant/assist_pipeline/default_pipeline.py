@@ -5,8 +5,11 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from dataclasses import asdict, dataclass, field
+import json
 import logging
 from pathlib import Path
+import re
+import time
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import hass_nabucasa
@@ -211,6 +214,105 @@ def _expand_bare_area_intent_input(hass: HomeAssistant, intent_input: str) -> st
             )
             return expanded
     return intent_input
+
+
+_DICTATION_MODE_PATH = Path("/config/.tcl_tv_dictation_mode.json")
+_DICTATION_REQUEST_PATH = Path("/config/.tcl_tv_type_request.json")
+
+_DICTATION_SUBMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)\s+(?:do\s+pole\s+|do\s+políčka\s+|text\s+)?a\s+(?:vyhledej|hledej|potvrď|potvrd|odešli|odesli)\s*[:,-]?\s*(.+)$"
+    ),
+    re.compile(
+        r"(?i)^(?:vyhledej|hledej)\s+(?:v\s+poli|do\s+pole|v\s+políčku|do\s+políčka)\s*[:,-]?\s*(.+)$"
+    ),
+)
+
+_DICTATION_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s+(?:do\s+pole|do\s+políčka|do\s+vyhledávání|pole|políčko|text))?(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+    re.compile(
+        r"(?i)^(?:do\s+pole|do\s+políčka|do\s+vyhledávání)\s+(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+)
+
+_EMPTY_DICTATION_TARGETS: frozenset[str] = frozenset(
+    {
+        "do pole",
+        "do políčka",
+        "do policka",
+        "do vyhledávání",
+        "do vyhledavani",
+        "pole",
+        "políčko",
+        "policko",
+        "text",
+    }
+)
+
+
+def _parse_dictation_command(user_text: str | None) -> tuple[str, bool] | None:
+    """Parse Czech voice dictation commands ('Vyplň do pole: Matrix') into (dictated_text, submit_flag)."""
+    if not user_text:
+        return None
+    cleaned = user_text.strip()
+    if not cleaned:
+        return None
+    for pattern in _DICTATION_SUBMIT_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, True)
+            return None
+    for pattern in _DICTATION_TYPE_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, False)
+            return None
+    return None
+
+
+def _consume_or_enqueue_dictation(user_text: str) -> tuple[str, bool] | None:
+    """Check if user_text is a dictation command or if long-press dictation mode is active; if so, enqueue ADB typing request."""
+    parsed = _parse_dictation_command(user_text)
+    if parsed is not None:
+        dictated_text, submit_flag = parsed
+    else:
+        try:
+            if not _DICTATION_MODE_PATH.exists():
+                return None
+            raw = _DICTATION_MODE_PATH.read_text(encoding="utf-8")
+            _DICTATION_MODE_PATH.unlink(missing_ok=True)
+            data = json.loads(raw)
+            if not data.get("active") or time.time() > float(data.get("expires_at", 0.0)):
+                return None
+        except Exception:
+            try:
+                _DICTATION_MODE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        dictated_text = (user_text or "").strip().rstrip(".!?").strip()
+        submit_flag = False
+        if not dictated_text:
+            return None
+
+    try:
+        _DICTATION_MODE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    payload = {
+        "text": dictated_text,
+        "submit": bool(submit_flag),
+        "ts": time.time(),
+    }
+    _DICTATION_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _DICTATION_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return (dictated_text, submit_flag)
 
 
 @dataclass
@@ -664,7 +766,12 @@ class _DefaultPipelineProcessor:
         if self.intent_agent is None or self._conversation_data is None:
             raise RuntimeError("Recognize intent was not prepared")
 
-        intent_input = _expand_bare_area_intent_input(self.host.hass, intent_input)
+        raw_intent_input = intent_input
+        dictation_match = await self.host.hass.async_add_executor_job(
+            _consume_or_enqueue_dictation, raw_intent_input
+        )
+        if dictation_match is None:
+            intent_input = _expand_bare_area_intent_input(self.host.hass, intent_input)
 
         if self.host.pipeline.conversation_language == MATCH_ALL:
             # LLMs support all languages ('*') so use languages from the
@@ -696,6 +803,30 @@ class _DefaultPipelineProcessor:
                 },
             )
         )
+
+        if dictation_match is not None:
+            dictated_text, _submit_flag = dictation_match
+            _LOGGER.info("Assist pipeline intercepted TV field dictation: %r", dictated_text)
+            dict_resp = intent.IntentResponse(language=input_language)
+            dict_resp.async_set_speech(
+                "",
+                extra_data={"dictated_text": dictated_text, "submit": _submit_flag},
+            )
+            dict_result = conversation.ConversationResult(
+                response=dict_resp,
+                conversation_id=conversation_id,
+                continue_conversation=False,
+            )
+            self.host.process_event(
+                PipelineEvent(
+                    PipelineEventType.INTENT_END,
+                    {
+                        "processed_locally": True,
+                        "intent_output": dict_result.as_dict(),
+                    },
+                )
+            )
+            return ("", False)
 
         try:
             if self.tts_stream and self.tts_stream.supports_streaming_input:

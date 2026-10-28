@@ -227,6 +227,107 @@ def _expand_bare_area_command(hass: HomeAssistant, user_text: str) -> str:
     return user_text
 
 
+_DICTATION_MODE_PATH = Path("/config/.tcl_tv_dictation_mode.json")
+_DICTATION_REQUEST_PATH = Path("/config/.tcl_tv_type_request.json")
+
+_DICTATION_SUBMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)\s+(?:do\s+pole\s+|do\s+políčka\s+|text\s+)?a\s+(?:vyhledej|hledej|potvrď|potvrd|odešli|odesli)\s*[:,-]?\s*(.+)$"
+    ),
+    re.compile(
+        r"(?i)^(?:vyhledej|hledej)\s+(?:v\s+poli|do\s+pole|v\s+políčku|do\s+políčka)\s*[:,-]?\s*(.+)$"
+    ),
+)
+
+_DICTATION_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s+(?:do\s+pole|do\s+políčka|do\s+vyhledávání|pole|políčko|text))?(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+    re.compile(
+        r"(?i)^(?:do\s+pole|do\s+políčka|do\s+vyhledávání)\s+(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+)
+
+_EMPTY_DICTATION_TARGETS: frozenset[str] = frozenset(
+    {
+        "do pole",
+        "do políčka",
+        "do policka",
+        "do vyhledávání",
+        "do vyhledavani",
+        "pole",
+        "políčko",
+        "policko",
+        "text",
+    }
+)
+
+
+def _parse_dictation_command(user_text: str | None) -> tuple[str, bool] | None:
+    """Parse Czech voice dictation commands ('Vyplň do pole: Matrix') into (dictated_text, submit_flag)."""
+    if not user_text:
+        return None
+    cleaned = user_text.strip()
+    if not cleaned:
+        return None
+    for pattern in _DICTATION_SUBMIT_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, True)
+            return None
+    for pattern in _DICTATION_TYPE_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, False)
+            return None
+    return None
+
+
+def _consume_or_enqueue_dictation(user_text: str) -> tuple[str, bool] | None:
+    """Check if user_text is a dictation command or if long-press dictation mode is active; if so, enqueue ADB typing request."""
+    import time as _time
+
+    parsed = _parse_dictation_command(user_text)
+    if parsed is not None:
+        dictated_text, submit_flag = parsed
+    else:
+        try:
+            if not _DICTATION_MODE_PATH.exists():
+                return None
+            raw = _DICTATION_MODE_PATH.read_text(encoding="utf-8")
+            _DICTATION_MODE_PATH.unlink(missing_ok=True)
+            data = json.loads(raw)
+            if not data.get("active") or _time.time() > float(data.get("expires_at", 0.0)):
+                return None
+        except Exception:
+            try:
+                _DICTATION_MODE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        dictated_text = (user_text or "").strip().rstrip(".!?").strip()
+        submit_flag = False
+        if not dictated_text:
+            return None
+
+    try:
+        _DICTATION_MODE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+    payload = {
+        "text": dictated_text,
+        "submit": bool(submit_flag),
+        "ts": _time.time(),
+    }
+    _DICTATION_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _DICTATION_REQUEST_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return (dictated_text, submit_flag)
+
+
 def _build_smarthome_live_telemetry(hass: HomeAssistant) -> str:
     """Build an exact real-time Czech telemetry summary from sensor.deye_15kw_telemetry and hass.states."""
     def _st(eid: str, default: str = "neznámé") -> str:
@@ -474,6 +575,23 @@ class GoogleGenerativeAIConversationEntity(
             silent_resp.async_set_speech("Neslyšel jsem žádný příkaz.")
             return conversation.ConversationResult(
                 response=silent_resp,
+                conversation_id=chat_log.conversation_id,
+                continue_conversation=False,
+            )
+
+        dictation_match = await self.hass.async_add_executor_job(
+            _consume_or_enqueue_dictation, user_input.text or ""
+        )
+        if dictation_match is not None:
+            dictated_text, _submit_flag = dictation_match
+            LOGGER.info("Intercepted TV field dictation request: %r", dictated_text)
+            dict_resp = intent.IntentResponse(language=user_input.language)
+            dict_resp.async_set_speech(
+                "",
+                extra_data={"dictated_text": dictated_text, "submit": _submit_flag},
+            )
+            return conversation.ConversationResult(
+                response=dict_resp,
                 conversation_id=chat_log.conversation_id,
                 continue_conversation=False,
             )

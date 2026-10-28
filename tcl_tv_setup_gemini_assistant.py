@@ -15,12 +15,21 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import zlib
 from pathlib import Path
 
 TV_TARGET = os.environ.get("TCL_TV_ADB_TARGET", "<TV_IP_ADDRESS>:5555")
 APK_PATH = Path(os.environ.get("HA_APK_PATH", "/usr/share/hassio/homeassistant/www/ha-companion-tv.apk"))
 STATE_FILE = Path(os.environ.get("TCL_STATE_FILE", "/usr/share/hassio/homeassistant/.tcl_tv_assistant_provisioned.json"))
+DICTATION_MODE_FILE = Path(
+    os.environ.get("TCL_DICTATION_MODE_FILE", "/usr/share/hassio/homeassistant/.tcl_tv_dictation_mode.json")
+)
+DICTATION_REQUEST_FILE = Path(
+    os.environ.get("TCL_DICTATION_REQUEST_FILE", "/usr/share/hassio/homeassistant/.tcl_tv_type_request.json")
+)
+LONG_PRESS_HOLD_SEC = 0.65
+DICTATION_TTL_SEC = 18.0
 HA_PKG = "io.homeassistant.companion.android"
 KATNISS_PKG = "com.google.android.katniss"
 ASSIST_ACTIVITY = "io.homeassistant.companion.android/io.homeassistant.companion.android.assist.AssistActivity"
@@ -46,6 +55,42 @@ REMOTE_GETEVENT_KEY_TRIGGERS: tuple[str, ...] = (
     "KEY_VOICE_ASSIST",
     "0246",
     "00d9",
+)
+
+DICTATION_LONG_PRESS_LOG_TRIGGERS: tuple[str, ...] = (
+    "act=android.intent.action.SEARCH_LONG_PRESS",
+)
+
+_DICTATION_SUBMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)\s+(?:do\s+pole\s+|do\s+políčka\s+|text\s+)?a\s+(?:vyhledej|hledej|potvrď|potvrd|odešli|odesli)\s*[:,-]?\s*(.+)$"
+    ),
+    re.compile(
+        r"(?i)^(?:vyhledej|hledej)\s+(?:v\s+poli|do\s+pole|v\s+políčku|do\s+políčka)\s*[:,-]?\s*(.+)$"
+    ),
+)
+
+_DICTATION_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s+(?:do\s+pole|do\s+políčka|do\s+vyhledávání|pole|políčko|text))?(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+    re.compile(
+        r"(?i)^(?:do\s+pole|do\s+políčka|do\s+vyhledávání)\s+(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis)(?:\s*[:,-]\s*|\s+)(.*)$"
+    ),
+)
+
+_EMPTY_DICTATION_TARGETS: frozenset[str] = frozenset(
+    {
+        "do pole",
+        "do políčka",
+        "do policka",
+        "do vyhledávání",
+        "do vyhledavani",
+        "pole",
+        "políčko",
+        "policko",
+        "text",
+    }
 )
 
 SILENCE_MARKERS: frozenset[str] = frozenset(
@@ -229,6 +274,136 @@ def expand_bare_area_command(user_text: str, light_states: dict[str, str] | None
             verb = "Zhasni" if any_on else "Rozsviť"
             return f"{verb} světla {canonical_phrase}"
     return user_text
+
+
+def parse_dictation_command(user_text: str | None) -> tuple[str, bool] | None:
+    """Parse Czech voice dictation commands ('Vyplň do pole: Matrix') into (dictated_text, submit_flag)."""
+    if not user_text:
+        return None
+    cleaned = user_text.strip()
+    if not cleaned:
+        return None
+    for pattern in _DICTATION_SUBMIT_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, True)
+            return None
+    for pattern in _DICTATION_TYPE_PATTERNS:
+        m = pattern.match(cleaned)
+        if m:
+            payload = m.group(1).strip().lstrip(":,-").rstrip(".!?").strip()
+            if payload and payload.lower() not in _EMPTY_DICTATION_TARGETS:
+                return (payload, False)
+            return None
+    return None
+
+
+def format_adb_input_text(text: str | None) -> str:
+    """Transliterate Czech diacritics to ASCII, strip shell metacharacters, and encode spaces as %s for `adb shell input text`."""
+    if not text:
+        return ""
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    safe_chars = re.sub(r"[^A-Za-z0-9 ._:@/+,-]", "", ascii_text)
+    collapsed = re.sub(r"\s+", " ", safe_chars).strip()
+    if not collapsed:
+        return ""
+    return collapsed.replace(" ", "%s")
+
+
+def should_activate_dictation_from_log_line(line: str) -> bool:
+    """Return True if a logcat line indicates a long-press on the TCL remote microphone button (SEARCH_LONG_PRESS)."""
+    if not line:
+        return False
+    return any(token in line for token in DICTATION_LONG_PRESS_LOG_TRIGGERS)
+
+
+def is_getevent_search_key_up(line: str) -> bool:
+    """Return True if a kernel getevent -l line indicates the TCL_RC602S voice button was released (UP)."""
+    if not line or "EV_KEY" not in line or "UP" not in line:
+        return False
+    return any(key in line for key in REMOTE_GETEVENT_KEY_TRIGGERS)
+
+
+def activate_dictation_mode(
+    source: str,
+    mode_file: Path = DICTATION_MODE_FILE,
+    ttl_sec: float = DICTATION_TTL_SEC,
+) -> None:
+    """Write the one-shot dictation mode flag file so the current Assist voice turn types raw text into the TV."""
+    now = time.time()
+    payload = {
+        "active": True,
+        "source": source,
+        "ts": now,
+        "expires_at": now + ttl_sec,
+    }
+    mode_file.parent.mkdir(parents=True, exist_ok=True)
+    mode_file.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def clear_dictation_mode(mode_file: Path = DICTATION_MODE_FILE) -> None:
+    """Remove any active dictation mode flag file."""
+    try:
+        if mode_file.exists():
+            mode_file.unlink()
+    except OSError:
+        pass
+
+
+def consume_dictation_mode(mode_file: Path = DICTATION_MODE_FILE) -> bool:
+    """Atomically consume and delete the dictation mode flag file; returns True if active and not expired."""
+    try:
+        if not mode_file.exists():
+            return False
+        raw = mode_file.read_text(encoding="utf-8")
+        mode_file.unlink(missing_ok=True)
+        data = json.loads(raw)
+        if not data.get("active"):
+            return False
+        expires_at = float(data.get("expires_at", 0.0))
+        return time.time() <= expires_at
+    except Exception:
+        try:
+            mode_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def enqueue_dictation_request(
+    text: str,
+    submit: bool = False,
+    req_file: Path = DICTATION_REQUEST_FILE,
+) -> None:
+    """Write a dictation text injection request for the host ADB worker thread."""
+    payload = {
+        "text": text,
+        "submit": bool(submit),
+        "ts": time.time(),
+    }
+    req_file.parent.mkdir(parents=True, exist_ok=True)
+    req_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def consume_dictation_request(req_file: Path = DICTATION_REQUEST_FILE) -> dict[str, object] | None:
+    """Atomically read and remove a pending dictation request file if present."""
+    try:
+        if not req_file.exists():
+            return None
+        raw = req_file.read_text(encoding="utf-8")
+        req_file.unlink(missing_ok=True)
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("text"):
+            return data
+        return None
+    except Exception:
+        try:
+            req_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
 
 
 def simulate_vad_preroll_and_onset(
@@ -537,9 +712,24 @@ def build_provision_commands() -> list[list[str]]:
     ]
 
 
+def _resolve_tv_target() -> str:
+    """Resolve the active ADB target from TCL_TV_ADB_TARGET or auto-detect a connected *:5555 device."""
+    env_target = os.environ.get("TCL_TV_ADB_TARGET", "")
+    if env_target and "<TV_IP_ADDRESS>" not in env_target:
+        return env_target
+    if "<TV_IP_ADDRESS>" not in TV_TARGET:
+        return TV_TARGET
+    res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=5, check=False)
+    for line in res.stdout.splitlines():
+        if ":5555\tdevice" in line:
+            return line.split("\t", 1)[0].strip()
+    return TV_TARGET
+
+
 def run_adb(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    target = _resolve_tv_target()
     return subprocess.run(
-        ["adb", "-s", TV_TARGET, *args],
+        ["adb", "-s", target, *args],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -548,10 +738,12 @@ def run_adb(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
 
 
 def is_tv_authorized() -> bool:
-    subprocess.run(["adb", "connect", TV_TARGET], capture_output=True, text=True, timeout=10, check=False)
+    target = _resolve_tv_target()
+    if "<TV_IP_ADDRESS>" not in target:
+        subprocess.run(["adb", "connect", target], capture_output=True, text=True, timeout=10, check=False)
     res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=10, check=False)
     for line in res.stdout.splitlines():
-        if TV_TARGET in line and "\tdevice" in line:
+        if target in line and "\tdevice" in line:
             return True
     return False
 
@@ -564,6 +756,43 @@ def remove_existing_assist_stacks() -> None:
         for sid in stack_ids:
             run_adb("shell", "am", "stack", "remove", sid, timeout=5)
         time.sleep(STACK_REMOVE_SETTLE_SEC)
+
+
+def inject_text_to_tv_field(text: str, submit: bool = False) -> bool:
+    """Dismiss AssistActivity overlay, focus Leanback SearchEditText if on SpeechOrbView, and inject text via ADB."""
+    formatted = format_adb_input_text(text)
+    if not formatted:
+        return False
+    print(f"Injecting dictated text into TCL TV input field: {text!r} (formatted={formatted!r}, submit={submit})", flush=True)
+    remove_existing_assist_stacks()
+    ime_dump = run_adb("shell", "dumpsys", "input_method", timeout=5).stdout
+    if "SpeechOrbView" in ime_dump or "TvSpeechOrbView" in ime_dump:
+        run_adb("shell", "input", "keyevent", "KEYCODE_DPAD_RIGHT", timeout=5)
+        time.sleep(0.35)
+    run_adb("shell", "input", "text", formatted, timeout=10)
+    if submit:
+        time.sleep(0.20)
+        run_adb("shell", "input", "keyevent", "KEYCODE_ENTER", timeout=5)
+    time.sleep(0.25)
+    post_ime_dump = run_adb("shell", "dumpsys", "input_method", timeout=5).stdout
+    if "mInputShown=true" in post_ime_dump:
+        run_adb("shell", "input", "keyevent", "KEYCODE_BACK", timeout=5)
+    return True
+
+
+def watch_dictation_requests() -> None:
+    """Poll DICTATION_REQUEST_FILE every 100ms and inject queued dictation text into the active TV input field."""
+    while True:
+        try:
+            req = consume_dictation_request(DICTATION_REQUEST_FILE)
+            if req is not None:
+                text = str(req.get("text", "")).strip()
+                submit = bool(req.get("submit", False))
+                if text:
+                    inject_text_to_tv_field(text, submit=submit)
+        except Exception as exc:
+            print("Dictation request watcher warning:", exc, flush=True)
+        time.sleep(0.10)
 
 
 def trigger_assist_activity(source_desc: str) -> None:
@@ -583,9 +812,10 @@ def provision_tv() -> bool:
     if not is_tv_authorized():
         return False
 
+    target = _resolve_tv_target()
     pkgs = run_adb("shell", "pm", "list", "packages", HA_PKG, timeout=15)
     if HA_PKG not in pkgs.stdout and APK_PATH.exists():
-        print(f"Installing {APK_PATH} onto {TV_TARGET}...", flush=True)
+        print(f"Installing {APK_PATH} onto {target}...", flush=True)
         inst = run_adb("install", "-r", str(APK_PATH), timeout=180)
         print("Install result:", inst.stdout, inst.stderr, flush=True)
         if "Success" not in inst.stdout:
@@ -598,7 +828,7 @@ def provision_tv() -> bool:
         json.dumps(
             {
                 "status": "provisioned",
-                "tv_target": TV_TARGET,
+                "tv_target": target,
                 "package": HA_PKG,
                 "katniss_disabled": True,
                 "assist_activity": ASSIST_ACTIVITY,
@@ -615,23 +845,47 @@ def provision_tv() -> bool:
 
 
 def watch_remote_getevent() -> None:
-    """Monitor Linux input events (/dev/input/event*) via PTY getevent -l for TCL_RC602S KEY_SEARCH DOWN."""
+    """Monitor Linux input events (/dev/input/event*) via PTY getevent -l for TCL_RC602S KEY_SEARCH DOWN and long-press hold."""
     while True:
         try:
             if not is_tv_authorized():
                 time.sleep(5)
                 continue
+            target = _resolve_tv_target()
             proc = subprocess.Popen(
-                ["adb", "-s", TV_TARGET, "shell", "-tt", "getevent", "-l"],
+                ["adb", "-s", target, "shell", "-tt", "getevent", "-l"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 errors="replace",
             )
             assert proc.stdout is not None
+            key_down_ts: float | None = None
+            hold_timer: threading.Timer | None = None
+
+            def _enable_long_press_dictation() -> None:
+                print("Detected TCL Remote Mic LONG PRESS (>= 0.65s hold) -> enabling Direct Dictation Mode", flush=True)
+                activate_dictation_mode("getevent_hold_timer")
+
             for line in proc.stdout:
                 if should_trigger_assist_from_getevent_line(line):
+                    if hold_timer is not None:
+                        hold_timer.cancel()
+                    clear_dictation_mode()
+                    key_down_ts = time.time()
+                    hold_timer = threading.Timer(LONG_PRESS_HOLD_SEC, _enable_long_press_dictation)
+                    hold_timer.daemon = True
+                    hold_timer.start()
                     trigger_assist_activity(f"getevent: {line.strip()}")
+                elif is_getevent_search_key_up(line):
+                    if hold_timer is not None:
+                        hold_timer.cancel()
+                        hold_timer = None
+                    if key_down_ts is not None:
+                        held = time.time() - key_down_ts
+                        key_down_ts = None
+                        if held >= LONG_PRESS_HOLD_SEC:
+                            activate_dictation_mode(f"getevent_hold_{held:.2f}s")
             proc.wait(timeout=5)
         except Exception as exc:
             print("Getevent watcher warning:", exc, flush=True)
@@ -639,15 +893,16 @@ def watch_remote_getevent() -> None:
 
 
 def watch_remote_mic_button() -> None:
-    """Intercept TCL remote microphone button presses via logcat and launch Home Assistant AssistActivity."""
+    """Intercept TCL remote microphone button presses and SEARCH_LONG_PRESS events via logcat."""
     while True:
         try:
             if not is_tv_authorized():
                 time.sleep(5)
                 continue
+            target = _resolve_tv_target()
             run_adb("logcat", "-c", timeout=10)
             proc = subprocess.Popen(
-                ["adb", "-s", TV_TARGET, "logcat", "-v", "brief", "-T", "1"],
+                ["adb", "-s", target, "logcat", "-v", "brief", "-T", "1"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -655,7 +910,10 @@ def watch_remote_mic_button() -> None:
             )
             assert proc.stdout is not None
             for line in proc.stdout:
-                if should_trigger_assist_from_log_line(line):
+                if should_activate_dictation_from_log_line(line):
+                    print("Detected SEARCH_LONG_PRESS in logcat -> enabling Direct Dictation Mode", flush=True)
+                    activate_dictation_mode("logcat_search_long_press")
+                elif should_trigger_assist_from_log_line(line):
                     trigger_assist_activity(f"logcat: {line.strip()}")
             proc.wait(timeout=5)
         except Exception as exc:
@@ -664,12 +922,14 @@ def watch_remote_mic_button() -> None:
 
 
 def main() -> None:
-    print("Starting TCL 65C815 Home Assistant Voice Provisioner & Remote Hook...", flush=True)
+    print("Starting TCL 65C815 Home Assistant Voice Provisioner, Remote Hook & Dictation Worker...", flush=True)
     provision_tv()
     getevent_watcher = threading.Thread(target=watch_remote_getevent, daemon=True)
     getevent_watcher.start()
     logcat_watcher = threading.Thread(target=watch_remote_mic_button, daemon=True)
     logcat_watcher.start()
+    dictation_watcher = threading.Thread(target=watch_dictation_requests, daemon=True)
+    dictation_watcher.start()
     while True:
         try:
             if not STATE_FILE.exists():
