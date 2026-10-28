@@ -210,11 +210,15 @@ def compute_pcm16_rms(audio: bytes) -> float:
     return math.sqrt(sum_sq / n_samples)
 
 
-def normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float = 500.0) -> str:
-    """Normalize Czech STT output, repair clipped initial fricatives, and filter silence/noise markers."""
+def normalize_czech_stt_transcript(
+    raw_text: str | None,
+    audio_rms: float = 500.0,
+    is_dictation: bool = False,
+) -> str:
+    """Normalize STT output, repair clipped initial Czech fricatives in command mode, and preserve multilingual search terms in dictation mode."""
     if not raw_text:
         return ""
-    cleaned = raw_text.strip()
+    cleaned = raw_text.strip().strip('"').strip("'").strip()
     if not cleaned:
         return ""
     lowered = cleaned.lower()
@@ -222,8 +226,10 @@ def normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float = 500.
         return ""
     if audio_rms < 190.0 and lowered in LOW_RMS_HALLUCINATIONS:
         return ""
-    if cleaned.endswith(".") and (" " in cleaned or len(cleaned) <= 14):
+    if cleaned.endswith(".") and (" " in cleaned or len(cleaned) <= 14 or is_dictation):
         cleaned = cleaned[:-1].strip()
+    if is_dictation or parse_dictation_command(cleaned) is not None:
+        return cleaned
     replacements = (
         ("Denis potřeba", "denní spotřeba"),
         ("denis potřeba", "denní spotřeba"),
@@ -350,6 +356,20 @@ def clear_dictation_mode(mode_file: Path = DICTATION_MODE_FILE) -> None:
             mode_file.unlink()
     except OSError:
         pass
+
+
+def peek_dictation_mode(mode_file: Path = DICTATION_MODE_FILE) -> bool:
+    """Non-destructively check whether the dictation mode flag file is active and not expired (used by STT stage)."""
+    try:
+        if not mode_file.exists():
+            return False
+        data = json.loads(mode_file.read_text(encoding="utf-8"))
+        if not data.get("active"):
+            return False
+        expires_at = float(data.get("expires_at", 0.0))
+        return time.time() <= expires_at
+    except Exception:
+        return False
 
 
 def consume_dictation_mode(mode_file: Path = DICTATION_MODE_FILE) -> bool:
@@ -766,7 +786,12 @@ def inject_text_to_tv_field(text: str, submit: bool = False) -> bool:
     print(f"Injecting dictated text into TCL TV input field: {text!r} (formatted={formatted!r}, submit={submit})", flush=True)
     remove_existing_assist_stacks()
     ime_dump = run_adb("shell", "dumpsys", "input_method", timeout=5).stdout
-    if "SpeechOrbView" in ime_dump or "TvSpeechOrbView" in ime_dump:
+    if (
+        "SpeechOrbView" in ime_dump
+        or "TvSpeechOrbView" in ime_dump
+        or "dev.cobalt.media.VideoSurfaceView" in ime_dump
+        or "com.google.android.youtube.tv" in ime_dump
+    ):
         run_adb("shell", "input", "keyevent", "KEYCODE_DPAD_RIGHT", timeout=5)
         time.sleep(0.35)
     run_adb("shell", "input", "text", formatted, timeout=10)
@@ -923,13 +948,13 @@ def watch_remote_mic_button() -> None:
 
 def main() -> None:
     print("Starting TCL 65C815 Home Assistant Voice Provisioner, Remote Hook & Dictation Worker...", flush=True)
-    provision_tv()
     getevent_watcher = threading.Thread(target=watch_remote_getevent, daemon=True)
     getevent_watcher.start()
     logcat_watcher = threading.Thread(target=watch_remote_mic_button, daemon=True)
     logcat_watcher.start()
     dictation_watcher = threading.Thread(target=watch_dictation_requests, daemon=True)
     dictation_watcher.start()
+    provision_tv()
     while True:
         try:
             if not STATE_FILE.exists():

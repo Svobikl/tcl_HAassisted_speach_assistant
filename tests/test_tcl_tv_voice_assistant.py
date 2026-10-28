@@ -36,6 +36,7 @@ from tcl_tv_setup_gemini_assistant import (
     format_adb_input_text,
     is_getevent_search_key_up,
     parse_dictation_command,
+    peek_dictation_mode,
     should_activate_dictation_from_log_line,
 )
 
@@ -520,6 +521,81 @@ def test_long_press_detection_and_dictation_queue_lifecycle(tmp_path) -> None:
     assert req["text"] == "Matrix Reloaded"
     assert req["submit"] is True
     assert consume_dictation_request(req_file) is None
+
+
+def test_peek_dictation_mode_is_nondestructive_for_stt_stage(tmp_path) -> None:
+    """Verify peek_dictation_mode lets stt.py inspect active dictation mode without consuming it before conversation.py."""
+    mode_file = tmp_path / ".tcl_tv_dictation_mode.json"
+    assert peek_dictation_mode(mode_file) is False
+
+    activate_dictation_mode("long_press_mic", mode_file=mode_file, ttl_sec=18.0)
+    # Stage 1 (STT) peeks non-destructively
+    assert peek_dictation_mode(mode_file) is True
+    assert mode_file.exists()
+    # Stage 2 (Conversation) consumes and deletes
+    assert consume_dictation_mode(mode_file) is True
+    assert peek_dictation_mode(mode_file) is False
+
+    # Expired flag must return False on peek
+    activate_dictation_mode("expired_mic", mode_file=mode_file, ttl_sec=-1.0)
+    assert peek_dictation_mode(mode_file) is False
+
+
+def test_stt_and_whisper_support_multilingual_dictation_and_resilient_cloud_fallback() -> None:
+    """Verify stt.py and local_whisper_stt_server.py implement all 4 dictation & timeout fixes."""
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assistant_text = (repo_root / "tcl_tv_setup_gemini_assistant.py").read_text(encoding="utf-8")
+    stt_text = (
+        repo_root / "homeassistant/custom_components/google_generative_ai_conversation/stt.py"
+    ).read_text(encoding="utf-8")
+    whisper_text = (repo_root / "scripts/local_whisper_stt_server.py").read_text(encoding="utf-8")
+
+    # Fix 4: YouTube Cobalt VideoSurfaceView focus shift from 'Mluvte...' mic orb before adb input text
+    assert "dev.cobalt.media.VideoSurfaceView" in assistant_text
+
+    # Fix 1: Multilingual dictation prompt & non-destructive peek of .tcl_tv_dictation_mode.json
+    assert "DICTATION_MULTILINGUAL_STT_PROMPT" in stt_text
+    assert "_peek_dictation_mode" in stt_text
+    assert "is_dictation: bool = False" in stt_text
+
+    # Fix 2: 4-model Gemini fallback chain, IPv4 preference, >=5.5s/7.5s timeout, and per-model cooldown (no 45s global lockout)
+    assert '"models/gemini-2.5-flash"' in stt_text
+    assert '"models/gemini-3.6-flash"' in stt_text
+    assert "_ipv4_preferred_getaddrinfo" in stt_text
+    assert "thinking_budget=0" in stt_text
+    assert "DEFAULT_GEMINI_STT_TIMEOUT_SEC = 5.5" in stt_text
+    assert "DICTATION_GEMINI_STT_TIMEOUT_SEC = 7.5" in stt_text
+    assert "_model_cooldown_until" in stt_text
+    assert "+ 45.0" not in stt_text
+
+    # Fix 3: ThreadingHTTPServer, temperature=0.0, without_timestamps=True, dictation=1, BrokenPipeError guard
+    assert "ThreadingHTTPServer" in whisper_text
+    assert "temperature=0.0" in whisper_text
+    assert "without_timestamps=True" in whisper_text
+    assert "dictation" in whisper_text
+    assert "BrokenPipeError" in whisper_text
+
+
+def test_normalize_czech_stt_transcript_preserves_english_in_dictation_mode() -> None:
+    """Verify normalize_czech_stt_transcript skips Czech smart-home phonetic rewrites when is_dictation=True."""
+    assert (
+        normalize_czech_stt_transcript("LLM inference on MacBook.", audio_rms=600.0, is_dictation=True)
+        == "LLM inference on MacBook"
+    )
+    assert (
+        normalize_czech_stt_transcript("Matt Armstrong", audio_rms=600.0, is_dictation=True)
+        == "Matt Armstrong"
+    )
+    # In dictation mode, even a phrase matching _CLIPPED_ZHASNI_RE must not be rewritten into 'zhasni ...'
+    assert (
+        normalize_czech_stt_transcript("asi v obýváku", audio_rms=600.0, is_dictation=True)
+        == "asi v obýváku"
+    )
+    # Silence and low-RMS hallucinations are still filtered in dictation mode
+    assert normalize_czech_stt_transcript("<noise>", audio_rms=150.0, is_dictation=True) == ""
+    assert normalize_czech_stt_transcript("Děkuji.", audio_rms=120.0, is_dictation=True) == ""
 
 
 def test_repository_contains_zero_secrets() -> None:

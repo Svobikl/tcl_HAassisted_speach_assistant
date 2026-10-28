@@ -11,12 +11,35 @@ import logging
 import math
 import pathlib
 import re
+import socket
 import sys
 import time
 import urllib.request
 import wave
 
 from google.genai import errors as genai_errors, types
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_preferred_getaddrinfo(
+    host: str | bytes | None,
+    port: str | bytes | int | None,
+    family: int = 0,
+    type: int = 0,
+    proto: int = 0,
+    flags: int = 0,
+):
+    """Prefer IPv4 (AF_INET) when resolving Google API hosts to prevent 4s IPv6 SYN blackholes on dual-stack LANs."""
+    if family == 0 and isinstance(host, str) and "googleapis.com" in host:
+        try:
+            return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+        except OSError:
+            pass
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_preferred_getaddrinfo
 import voluptuous as vol
 
 from homeassistant.components import stt
@@ -38,7 +61,7 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_STT_PROMPT = "Transcribe the spoken audio accurately."
 
 CZECH_SMART_HOME_STT_PROMPT = (
-    "Přepiš mluvenou češtinu z nahrávky přesně slovo od slova. "
+    "Přepiš mluvenou řeč z nahrávky přesně slovo od slova. "
     "Vrať pouze samotný přepis řeči bez uvozovek a bez komentářů. "
     "Pokud nahrávka obsahuje pouze ticho nebo šum, vrať prázdný řetězec. "
     "Časté povely a místnosti v domě (mohou zaznít samostatně nebo ve spojení): "
@@ -46,14 +69,36 @@ CZECH_SMART_HOME_STT_PROMPT = (
     "v obýváku, obývák, v zádveří, zádveří, v kuchyni, kuchyň, v ložnici, ložnice, "
     "v koupelně, koupelna, na chodbě, chodba, v pracovně, pracovna, v garáži, garáž, "
     "v šatně, šatna, na terase, terasa, v sauně, sauna, žaluzie, světla, "
-    "FVE, Deye, Loxone, Eastron, denní spotřeba."
+    "FVE, Deye, Loxone, Eastron, denní spotřeba. "
+    "Pokud příkaz začíná slovy 'vyplň do pole', 'napiš do pole', 'zadej do pole', "
+    "'vepiš do pole', 'vyhledej v poli', 'vyplň' nebo 'napiš', může za ním následovat "
+    "český nebo anglický hledaný výraz (názvy filmů, YouTube videí, jmen nebo anglických "
+    "technických pojmů jako Matrix, Matt Armstrong, LLM inference on MacBook) — "
+    "anglická slova nepřekládej do češtiny a zapiš je v původním anglickém pravopisu."
+)
+
+DICTATION_MULTILINGUAL_STT_PROMPT = (
+    "Transcribe the spoken search query or dictated text from the audio clip accurately word-for-word. "
+    "The speaker may dictate in Czech, English, or a mix of Czech and English (such as movie titles, "
+    "YouTube search queries, channel names, people, products, or technical terms like 'Matrix', "
+    "'Matt Armstrong', 'LLM inference on MacBook', 'Raspberry Pi 5', 'Toyota Yaris GR', 'Pelíšky'). "
+    "Do NOT translate English words into Czech phonetics. "
+    "Return ONLY the raw transcription without quotes, explanations, or trailing periods. "
+    "If the audio contains only silence or noise, return an empty string."
 )
 
 FAST_STT_MODEL_CANDIDATES: tuple[str, ...] = (
-    "models/gemini-3.5-flash-lite",
-    "models/gemini-3.1-flash-lite",
+    "models/gemini-2.5-flash",
+    "models/gemini-3.6-flash",
+    "models/gemini-3.5-flash",
+    "models/gemini-3-flash-preview",
 )
 
+DEFAULT_GEMINI_STT_TIMEOUT_SEC = 5.5
+DICTATION_GEMINI_STT_TIMEOUT_SEC = 7.5
+MODEL_COOLDOWN_SEC = 10.0
+
+DICTATION_MODE_FILE = pathlib.Path("/config/.tcl_tv_dictation_mode.json")
 LOCAL_WHISPER_URL = "http://localhost:8765/transcribe?lang=cs&mode=local"
 
 SILENCE_MARKERS: frozenset[str] = frozenset(
@@ -79,6 +124,10 @@ LOW_RMS_HALLUCINATIONS: frozenset[str] = frozenset(
     }
 )
 
+_DICTATION_PREFIX_RE = re.compile(
+    r"(?i)^(?:vyplň|vypln|napiš|napis|zadej|vepiš|vepis|vyhledej\s+v\s+poli)\b"
+)
+
 _ROOM_PATTERN = (
     r"(?:v\s+obýváku|v\s+obyvaku|obývák|obyvak|v\s+zádveří|v\s+zadveri|zádveří|zadveri|"
     r"v\s+kuchyni|kuchyň|kuchyn|v\s+ložnici|v\s+loznici|ložnice|loznice|"
@@ -100,7 +149,21 @@ STT_SCHEMA = vol.Schema(
 )
 
 _preferred_working_stt_model: str = FAST_STT_MODEL_CANDIDATES[0]
-_gemini_cooldown_until: float = 0.0
+_model_cooldown_until: dict[str, float] = {}
+
+
+def _peek_dictation_mode(mode_file: pathlib.Path = DICTATION_MODE_FILE) -> bool:
+    """Non-destructively check whether the long-press dictation mode flag file is active and not expired."""
+    try:
+        if not mode_file.exists():
+            return False
+        data = json.loads(mode_file.read_text(encoding="utf-8"))
+        if not data.get("active"):
+            return False
+        expires_at = float(data.get("expires_at", 0.0))
+        return time.time() <= expires_at
+    except Exception:
+        return False
 
 
 def _compute_pcm16_rms(audio: bytes) -> float:
@@ -116,11 +179,15 @@ def _compute_pcm16_rms(audio: bytes) -> float:
     return math.sqrt(sum_sq / n_samples)
 
 
-def _normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float) -> str:
-    """Clean STT transcript, repair clipped Czech fricatives, and reject silence markers."""
+def _normalize_czech_stt_transcript(
+    raw_text: str | None,
+    audio_rms: float,
+    is_dictation: bool = False,
+) -> str:
+    """Clean STT transcript, repair clipped Czech fricatives in command mode, and preserve multilingual queries in dictation mode."""
     if not raw_text:
         return ""
-    cleaned = raw_text.strip()
+    cleaned = raw_text.strip().strip('"').strip("'").strip()
     if not cleaned:
         return ""
     lowered = cleaned.lower()
@@ -128,8 +195,10 @@ def _normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float) -> s
         return ""
     if audio_rms < 190.0 and lowered in LOW_RMS_HALLUCINATIONS:
         return ""
-    if cleaned.endswith(".") and (" " in cleaned or len(cleaned) <= 14):
+    if cleaned.endswith(".") and (" " in cleaned or len(cleaned) <= 14 or is_dictation):
         cleaned = cleaned[:-1].strip()
+    if is_dictation or _DICTATION_PREFIX_RE.match(cleaned):
+        return cleaned
     replacements = (
         ("Denis potřeba", "denní spotřeba"),
         ("denis potřeba", "denní spotřeba"),
@@ -141,6 +210,8 @@ def _normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float) -> s
         ("zhasný ", "zhasni "),
         ("asi povídáku", "zhasni v obýváku"),
         ("Asi povídáku", "Zhasni v obýváku"),
+        ("hlasitě v obýváku", "zhasni v obýváku"),
+        ("Hlasitě v obýváku", "Zhasni v obýváku"),
         ("v povídáku", "v obýváku"),
         ("povídáku", "v obýváku"),
         ("vzár veří", "v zádveří"),
@@ -168,17 +239,24 @@ def _normalize_czech_stt_transcript(raw_text: str | None, audio_rms: float) -> s
     return cleaned
 
 
-def _transcribe_with_local_whisper_sync(wav_bytes: bytes, lang: str = "cs") -> str | None:
+def _transcribe_with_local_whisper_sync(
+    wav_bytes: bytes,
+    lang: str = "cs",
+    is_dictation: bool = False,
+) -> str | None:
     """Call the warm local faster-whisper daemon on localhost:8765 in local-only mode."""
-    lang_code = "en" if lang.startswith("en") else "cs"
-    url = f"http://localhost:8765/transcribe?lang={lang_code}&mode=local"
+    if is_dictation:
+        url = "http://localhost:8765/transcribe?lang=auto&mode=local&dictation=1"
+    else:
+        lang_code = "en" if (lang or "").lower().startswith("en") else "cs"
+        url = f"http://localhost:8765/transcribe?lang={lang_code}&mode=local"
     req = urllib.request.Request(
         url,
         data=wav_bytes,
         headers={"Content-Type": "audio/wav"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=8.0) as resp:
+    with urllib.request.urlopen(req, timeout=12.0) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         return data.get("text", "")
 
@@ -252,7 +330,7 @@ class GoogleGenerativeAISttEntity(stt.SpeechToTextEntity, GoogleGenerativeAILLMB
         self, metadata: stt.SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> stt.SpeechResult:
         """Process an audio stream to STT service with fast Gemini -> Local Whisper fallback."""
-        global _preferred_working_stt_model, _gemini_cooldown_until
+        global _preferred_working_stt_model
         t_start = time.monotonic()
         audio_chunks: list[bytes] = []
         async for chunk in stream:
@@ -288,30 +366,42 @@ class GoogleGenerativeAISttEntity(stt.SpeechToTextEntity, GoogleGenerativeAILLMB
         else:
             return stt.SpeechResult("", stt.SpeechResultState.ERROR)
 
+        is_dictation = _peek_dictation_mode(DICTATION_MODE_FILE)
         lang = (metadata.language or "").lower()
-        if lang.startswith("cs"):
+        if is_dictation:
+            prompt = DICTATION_MULTILINGUAL_STT_PROMPT
+            gemini_timeout = DICTATION_GEMINI_STT_TIMEOUT_SEC
+        elif lang.startswith("cs"):
             prompt = CZECH_SMART_HOME_STT_PROMPT
+            gemini_timeout = DEFAULT_GEMINI_STT_TIMEOUT_SEC
         else:
             prompt = self.subentry.data.get(
                 CONF_PROMPT, RECOMMENDED_STT_OPTIONS[CONF_PROMPT]
             )
+            gemini_timeout = DEFAULT_GEMINI_STT_TIMEOUT_SEC
 
-        now = time.monotonic()
         force_local_whisper = (
             pathlib.Path("/config/.force_local_whisper_stt").exists()
             or pathlib.Path("/tmp/force_local_whisper_stt").exists()
         )
 
-        if not force_local_whisper and now >= _gemini_cooldown_until:
+        if not force_local_whisper:
             ordered_models: list[str] = [_preferred_working_stt_model]
             for m in FAST_STT_MODEL_CANDIDATES:
                 if m not in ordered_models:
                     ordered_models.append(m)
 
-            for candidate_model in ordered_models:
+            now = time.monotonic()
+            active_candidates = [
+                m for m in ordered_models if now >= _model_cooldown_until.get(m, 0.0)
+            ]
+            if not active_candidates:
+                active_candidates = list(ordered_models)
+
+            for candidate_model in active_candidates:
                 try:
                     t_call = time.monotonic()
-                    async with asyncio.timeout(2.8):
+                    async with asyncio.timeout(gemini_timeout):
                         response = await self._genai_client.aio.models.generate_content(
                             model=candidate_model,
                             contents=[
@@ -324,13 +414,18 @@ class GoogleGenerativeAISttEntity(stt.SpeechToTextEntity, GoogleGenerativeAILLMB
                             config=types.GenerateContentConfig(
                                 temperature=0.0,
                                 max_output_tokens=96,
+                                thinking_config=types.ThinkingConfig(thinking_budget=0),
                             ),
                         )
                     _preferred_working_stt_model = candidate_model
-                    normalized = _normalize_czech_stt_transcript(response.text, audio_rms)
+                    _model_cooldown_until.pop(candidate_model, None)
+                    normalized = _normalize_czech_stt_transcript(
+                        response.text, audio_rms, is_dictation=is_dictation
+                    )
                     _LOGGER.info(
-                        "Gemini STT (%s) completed in %.2fs (total %.2fs, RMS=%.1f): %r",
+                        "Gemini STT (%s, dictation=%s) completed in %.2fs (total %.2fs, RMS=%.1f): %r",
                         candidate_model,
+                        is_dictation,
                         time.monotonic() - t_call,
                         time.monotonic() - t_start,
                         audio_rms,
@@ -340,22 +435,25 @@ class GoogleGenerativeAISttEntity(stt.SpeechToTextEntity, GoogleGenerativeAILLMB
                         return stt.SpeechResult("", stt.SpeechResultState.ERROR)
                     return stt.SpeechResult(normalized, stt.SpeechResultState.SUCCESS)
                 except (genai_errors.APIError, TimeoutError, Exception) as err:
+                    _model_cooldown_until[candidate_model] = time.monotonic() + MODEL_COOLDOWN_SEC
                     _LOGGER.warning(
-                        "Gemini STT model %s failed/exhausted (%s), trying next or local Whisper...",
+                        "Gemini STT model %s failed/exhausted (%s), trying next candidate or local Whisper...",
                         candidate_model,
                         err,
                     )
-            _gemini_cooldown_until = time.monotonic() + 45.0
 
         # Fallback to Persistent Warm Local Faster-Whisper Daemon on RPi5 (localhost:8765)
         try:
             t_whisper = time.monotonic()
             whisper_text = await self.hass.async_add_executor_job(
-                _transcribe_with_local_whisper_sync, audio_bytes, lang
+                _transcribe_with_local_whisper_sync, audio_bytes, lang, is_dictation
             )
-            normalized = _normalize_czech_stt_transcript(whisper_text, audio_rms)
+            normalized = _normalize_czech_stt_transcript(
+                whisper_text, audio_rms, is_dictation=is_dictation
+            )
             _LOGGER.info(
-                "Local Faster-Whisper STT fallback completed in %.2fs (total %.2fs, RMS=%.1f): %r",
+                "Local Faster-Whisper STT fallback (dictation=%s) completed in %.2fs (total %.2fs, RMS=%.1f): %r",
+                is_dictation,
                 time.monotonic() - t_whisper,
                 time.monotonic() - t_start,
                 audio_rms,
