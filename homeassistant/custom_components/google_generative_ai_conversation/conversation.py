@@ -8,6 +8,7 @@ import codecs
 from collections.abc import Callable
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal, override
 import wave
 
@@ -287,8 +288,18 @@ def _parse_dictation_command(user_text: str | None) -> tuple[str, bool] | None:
     return None
 
 
+_SMARTHOME_COMMAND_RE = re.compile(
+    r"(?i)(?:\b(?:rozsviť|rozsvit|zhasni|zapni|vypni|vytáhni|vytahni|zatáhni|zatahni|otevři|otevri|zavři|zavri|nastav|ztlum|zesil|spusť|spust|zastav|ukliď|uklid|vysaj|spotřeba|spotreba|příkon|prikon|teplota|vlhkost|počasí|pocasi|baterie|elektrárna|elektrarna|fve|žaluzie|zaluzie|světla|svetla|světlo|svetlo)\b|"
+    r"(?:v\s+obýváku|v\s+obyvaku|obývák|obyvak|v\s+zádveří|v\s+zadveri|zádveří|zadveri|"
+    r"v\s+kuchyni|kuchyň|kuchyn|v\s+ložnici|v\s+loznici|ložnice|loznice|"
+    r"v\s+koupelně|v\s+koupelne|koupelna|na\s+chodbě|na\s+chodbe|v\s+chodbě|chodba|"
+    r"v\s+pracovně|v\s+pracovne|pracovna|v\s+garáži|v\s+garazi|garáž|garaz|"
+    r"v\s+šatně|v\s+satne|šatna|satna|na\s+terase|terasa|v\s+sauně|sauna))"
+)
+
+
 def _consume_or_enqueue_dictation(user_text: str) -> tuple[str, bool] | None:
-    """Check if user_text is a dictation command or if long-press dictation mode is active; if so, enqueue ADB typing request."""
+    """Check if user_text is an explicit dictation command or if dictation mode is active; never hijack smart-home commands."""
     import time as _time
 
     parsed = _parse_dictation_command(user_text)
@@ -311,7 +322,7 @@ def _consume_or_enqueue_dictation(user_text: str) -> tuple[str, bool] | None:
             return None
         dictated_text = (user_text or "").strip().rstrip(".!?").strip()
         submit_flag = False
-        if not dictated_text:
+        if not dictated_text or _SMARTHOME_COMMAND_RE.search(dictated_text):
             return None
 
     try:

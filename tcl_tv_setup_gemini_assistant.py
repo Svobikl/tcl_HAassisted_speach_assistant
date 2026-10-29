@@ -127,7 +127,11 @@ _CLIPPED_ZHASNI_RE = re.compile(
     rf"(?i)^(?:zhasni|zhasný|zhasny|hasni|zasni|vlastně|vlastne|hlasitě|hlasite|asi|jasně|jasne|zase)\s+({_ROOM_PATTERN})\b(.*)$"
 )
 _CLIPPED_ROZSVIT_RE = re.compile(
-    rf"(?i)^(?:rozsviť|rozsvit|rozsvědí|rozsvedi|rozsvěd|rozsved|sviť|svit|rozhlas|prosím\s+rozsviť)\s+({_ROOM_PATTERN})\b(.*)$"
+    rf"(?i)^(?:rozsviť|rozsvit|rozsvědí|rozsvedi|rozsvěd|rozsved|sviť|svit|rozhlas|prosím\s+rozsviť|vejít|vejit|půjde|pujde|jít|jit|být|byt)\s+({_ROOM_PATTERN})\b(.*)$"
+)
+
+_SMARTHOME_COMMAND_RE = re.compile(
+    rf"(?i)(?:\b(?:rozsviť|rozsvit|zhasni|zapni|vypni|vytáhni|vytahni|zatáhni|zatahni|otevři|otevri|zavři|zavri|nastav|ztlum|zesil|spusť|spust|zastav|ukliď|uklid|vysaj|spotřeba|spotreba|příkon|prikon|teplota|vlhkost|počasí|pocasi|baterie|elektrárna|elektrarna|fve|žaluzie|zaluzie|světla|svetla|světlo|svetlo)\b|{_ROOM_PATTERN})"
 )
 
 BARE_AREA_LIGHT_MAP: tuple[tuple[tuple[str, ...], str, tuple[str, ...]], ...] = (
@@ -304,6 +308,16 @@ def parse_dictation_command(user_text: str | None) -> tuple[str, bool] | None:
                 return (payload, False)
             return None
     return None
+
+
+def is_smarthome_voice_command(text: str | None) -> bool:
+    """Return True if the transcript is a Czech smart-home control or telemetry command that must never be typed into a TV field."""
+    if not text:
+        return False
+    cleaned = text.strip()
+    if not cleaned or parse_dictation_command(cleaned) is not None:
+        return False
+    return bool(_SMARTHOME_COMMAND_RE.search(cleaned))
 
 
 def format_adb_input_text(text: str | None) -> str:
@@ -780,12 +794,23 @@ def remove_existing_assist_stacks() -> None:
 
 def inject_text_to_tv_field(text: str, submit: bool = False) -> bool:
     """Dismiss AssistActivity overlay, focus Leanback SearchEditText if on SpeechOrbView, and inject text via ADB."""
+    if is_smarthome_voice_command(text):
+        print(f"Refusing to inject smart-home voice command as TV text: {text!r}", flush=True)
+        return False
     formatted = format_adb_input_text(text)
     if not formatted:
         return False
     print(f"Injecting dictated text into TCL TV input field: {text!r} (formatted={formatted!r}, submit={submit})", flush=True)
     remove_existing_assist_stacks()
     ime_dump = run_adb("shell", "dumpsys", "input_method", timeout=5).stdout
+    if (
+        "com.google.android.tvlauncher" in ime_dump
+        and "mInputShown=true" not in ime_dump
+        and "SpeechOrbView" not in ime_dump
+        and "TvSpeechOrbView" not in ime_dump
+    ):
+        print("Aborting text injection: TV is on Android TV Home Screen Launcher with no active input field.", flush=True)
+        return False
     if (
         "SpeechOrbView" in ime_dump
         or "TvSpeechOrbView" in ime_dump
@@ -870,7 +895,7 @@ def provision_tv() -> bool:
 
 
 def watch_remote_getevent() -> None:
-    """Monitor Linux input events (/dev/input/event*) via PTY getevent -l for TCL_RC602S KEY_SEARCH DOWN and long-press hold."""
+    """Monitor Linux input events (/dev/input/event*) via PTY getevent -l for TCL_RC602S KEY_SEARCH DOWN."""
     while True:
         try:
             if not is_tv_authorized():
@@ -885,32 +910,10 @@ def watch_remote_getevent() -> None:
                 errors="replace",
             )
             assert proc.stdout is not None
-            key_down_ts: float | None = None
-            hold_timer: threading.Timer | None = None
-
-            def _enable_long_press_dictation() -> None:
-                print("Detected TCL Remote Mic LONG PRESS (>= 0.65s hold) -> enabling Direct Dictation Mode", flush=True)
-                activate_dictation_mode("getevent_hold_timer")
-
             for line in proc.stdout:
                 if should_trigger_assist_from_getevent_line(line):
-                    if hold_timer is not None:
-                        hold_timer.cancel()
                     clear_dictation_mode()
-                    key_down_ts = time.time()
-                    hold_timer = threading.Timer(LONG_PRESS_HOLD_SEC, _enable_long_press_dictation)
-                    hold_timer.daemon = True
-                    hold_timer.start()
                     trigger_assist_activity(f"getevent: {line.strip()}")
-                elif is_getevent_search_key_up(line):
-                    if hold_timer is not None:
-                        hold_timer.cancel()
-                        hold_timer = None
-                    if key_down_ts is not None:
-                        held = time.time() - key_down_ts
-                        key_down_ts = None
-                        if held >= LONG_PRESS_HOLD_SEC:
-                            activate_dictation_mode(f"getevent_hold_{held:.2f}s")
             proc.wait(timeout=5)
         except Exception as exc:
             print("Getevent watcher warning:", exc, flush=True)
@@ -918,7 +921,7 @@ def watch_remote_getevent() -> None:
 
 
 def watch_remote_mic_button() -> None:
-    """Intercept TCL remote microphone button presses and SEARCH_LONG_PRESS events via logcat."""
+    """Intercept TCL remote microphone button presses via logcat in normal Smart Home Assist mode."""
     while True:
         try:
             if not is_tv_authorized():
@@ -935,10 +938,8 @@ def watch_remote_mic_button() -> None:
             )
             assert proc.stdout is not None
             for line in proc.stdout:
-                if should_activate_dictation_from_log_line(line):
-                    print("Detected SEARCH_LONG_PRESS in logcat -> enabling Direct Dictation Mode", flush=True)
-                    activate_dictation_mode("logcat_search_long_press")
-                elif should_trigger_assist_from_log_line(line):
+                if should_trigger_assist_from_log_line(line):
+                    clear_dictation_mode()
                     trigger_assist_activity(f"logcat: {line.strip()}")
             proc.wait(timeout=5)
         except Exception as exc:

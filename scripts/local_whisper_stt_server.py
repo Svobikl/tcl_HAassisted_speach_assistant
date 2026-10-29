@@ -91,7 +91,7 @@ _CLIPPED_ZHASNI_RE = re.compile(
     rf"(?i)^(?:zhasni|zhasný|zhasny|hasni|zasni|vlastně|vlastne|hlasitě|hlasite|asi|jasně|jasne|zase)\s+({_ROOM_PATTERN})\b(.*)$"
 )
 _CLIPPED_ROZSVIT_RE = re.compile(
-    rf"(?i)^(?:rozsviť|rozsvit|rozsvědí|rozsvedi|rozsvěd|rozsved|sviť|svit|rozhlas|prosím\s+rozsviť)\s+({_ROOM_PATTERN})\b(.*)$"
+    rf"(?i)^(?:rozsviť|rozsvit|rozsvědí|rozsvedi|rozsvěd|rozsved|sviť|svit|rozhlas|prosím\s+rozsviť|vejít|vejit|půjde|pujde|jít|jit|být|byt)\s+({_ROOM_PATTERN})\b(.*)$"
 )
 
 

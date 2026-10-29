@@ -35,6 +35,7 @@ from tcl_tv_setup_gemini_assistant import (
     enqueue_dictation_request,
     format_adb_input_text,
     is_getevent_search_key_up,
+    is_smarthome_voice_command,
     parse_dictation_command,
     peek_dictation_mode,
     should_activate_dictation_from_log_line,
@@ -596,6 +597,31 @@ def test_normalize_czech_stt_transcript_preserves_english_in_dictation_mode() ->
     # Silence and low-RMS hallucinations are still filtered in dictation mode
     assert normalize_czech_stt_transcript("<noise>", audio_rms=150.0, is_dictation=True) == ""
     assert normalize_czech_stt_transcript("Děkuji.", audio_rms=120.0, is_dictation=True) == ""
+
+
+def test_smarthome_commands_are_never_hijacked_by_dictation_and_vejit_pujde_repaired() -> None:
+    """Verify BLE-clipped 'vejít na chodbě'/'půjde na chodbě' repair to 'rozsviť na chodbě' and remote button never hijacks smart-home commands."""
+    from pathlib import Path
+
+    assert normalize_czech_stt_transcript("vejít na chodbě", audio_rms=600.0) == "rozsviť na chodbě"
+    assert normalize_czech_stt_transcript("půjde na chodbě", audio_rms=600.0) == "rozsviť na chodbě"
+    assert normalize_czech_stt_transcript("Vejít na chodbě.", audio_rms=600.0) == "Rozsviť na chodbě"
+    assert normalize_czech_stt_transcript("Půjde na chodbě.", audio_rms=600.0) == "Rozsviť na chodbě"
+
+    assert is_smarthome_voice_command("rozsviť na chodbě") is True
+    assert is_smarthome_voice_command("zhasni v obýváku") is True
+    assert is_smarthome_voice_command("jaká je denní spotřeba domu") is True
+    assert is_smarthome_voice_command("na chodbě") is True
+    assert is_smarthome_voice_command("Vyplň do pole: Matrix") is False
+    assert is_smarthome_voice_command("LLM inference on MacBook") is False
+    assert is_smarthome_voice_command("Matrix") is False
+
+    repo_root = Path(__file__).resolve().parent.parent
+    assistant_text = (repo_root / "tcl_tv_setup_gemini_assistant.py").read_text(encoding="utf-8")
+    # Ensure watch_remote_getevent and watch_remote_mic_button never call activate_dictation_mode automatically
+    assert 'activate_dictation_mode("getevent_hold_timer")' not in assistant_text
+    assert 'activate_dictation_mode("logcat_search_long_press")' not in assistant_text
+    assert "com.google.android.tvlauncher" in assistant_text
 
 
 def test_repository_contains_zero_secrets() -> None:
